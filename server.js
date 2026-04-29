@@ -1,6 +1,6 @@
 // ============================================================
 //  Servidor Node.js — WebSocket + Express
-//  Sistemas: Hidroponía + Parking
+//  Sistema: Parking (2 plumas independientes)
 //  Instalar: npm install ws express
 //  Ejecutar: node server.js
 // ============================================================
@@ -15,21 +15,17 @@ const app    = express();
 const server = http.createServer(app);
 app.use(express.json());
 
-// ── Estado Hidroponía ──────────────────────────────────────
-let estadoBomba    = false;
-let datosSensores  = { temperatura: null, ph: null, nivel: null };
-const notificacionesHidro = [];
-
 // ── Estado Parking ─────────────────────────────────────────
 const CAPACIDAD_MAX = 50;
 
 let estadoParking = {
   lugares_ocupados: 0,
   capacidad:        CAPACIDAD_MAX,
-  pluma:            "arriba",   // "arriba" | "abajo"
+  pluma_entrada:    "arriba",
+  pluma_salida:     "arriba",
   sensor_a:         false,
   sensor_b:         false,
-  ultimo_evento:    null,       // "entrada" | "salida"
+  ultimo_evento:    null,
 };
 
 const notificacionesParking = [];
@@ -39,32 +35,24 @@ const historialParking = [];    // últimos 20 eventos
 const wss        = new WebSocketServer({ server });
 const clienteMap = new Map();
 
-// ── REST: Hidroponía ───────────────────────────────────────
+// ═══════════════════════════════════════════════════════════
+//  REST — Parking
+// ═══════════════════════════════════════════════════════════
 
-// POST /cmd/hidro  body: { "bomba": true }
-app.post("/cmd/hidro", (req, res) => {
-  const { bomba } = req.body;
-  if (typeof bomba !== "boolean")
-    return res.status(400).json({ error: '"bomba" debe ser true o false' });
-
-  estadoBomba = bomba;
-  const payload = JSON.stringify({ type: "cmd_hidro", bomba: estadoBomba });
-  broadcast(payload, "esp32_hidro");
-  broadcast(payload, "dashboard");
-  timestamp(`[REST] Bomba hidroponía: ${estadoBomba ? "ENCENDIDA" : "APAGADA"}`);
-  res.json({ ok: true, bomba: estadoBomba });
-});
-
-// ── REST: Parking ──────────────────────────────────────────
-
-// POST /cmd/parking  body: { "pluma": "arriba" | "abajo" }
+/*
+  POST /cmd/parking
+  body: { "puerta": "entrada" | "salida", "accion": "arriba" | "abajo" }
+*/
 app.post("/cmd/parking", (req, res) => {
-  const { pluma } = req.body;
-  if (pluma !== "arriba" && pluma !== "abajo")
-    return res.status(400).json({ error: '"pluma" debe ser "arriba" o "abajo"' });
+  const { puerta, accion } = req.body;
 
-  ordenarPluma(pluma);
-  res.json({ ok: true, pluma });
+  if (puerta !== "entrada" && puerta !== "salida")
+    return res.status(400).json({ error: '"puerta" debe ser "entrada" o "salida"' });
+  if (accion !== "arriba" && accion !== "abajo")
+    return res.status(400).json({ error: '"accion" debe ser "arriba" o "abajo"' });
+
+  ordenarPluma(puerta, accion);
+  res.json({ ok: true, puerta, accion });
 });
 
 // POST /cmd/parking/reset  — reinicia contador (admin)
@@ -76,39 +64,20 @@ app.post("/cmd/parking/reset", (_req, res) => {
   res.json({ ok: true, lugares_ocupados: 0 });
 });
 
-// ── REST: Estado general ───────────────────────────────────
-app.get("/state", (_req, res) => {
-  res.json({
-    hidro:   { bomba: estadoBomba, sensores: datosSensores },
-    parking: estadoParking,
-  });
-});
-
-app.get("/state/hidro", (_req, res) => {
-  res.json({ bomba: estadoBomba, sensores: datosSensores });
-});
-
-app.get("/state/parking", (_req, res) => {
-  res.json(estadoParking);
-});
-
-app.get("/notifications", (_req, res) => {
-  res.json({
-    hidro:   notificacionesHidro,
-    parking: notificacionesParking,
-  });
-});
-
-app.get("/parking/history", (_req, res) => {
-  res.json(historialParking);
-});
-
-app.get("/status", (_req, res) => {
+// ═══════════════════════════════════════════════════════════
+//  REST — Estado y utilidades
+// ═══════════════════════════════════════════════════════════
+app.get("/state",             (_req, res) => res.json(estadoParking));
+app.get("/notifications",     (_req, res) => res.json(notificacionesParking));
+app.get("/parking/history",   (_req, res) => res.json(historialParking));
+app.get("/status",            (_req, res) => {
   const clientes = [...clienteMap.values()].map(({ device, ip }) => ({ device, ip }));
   res.json({ clientes, total: clienteMap.size });
 });
 
-// ── WebSocket: Eventos ─────────────────────────────────────
+// ═══════════════════════════════════════════════════════════
+//  WebSocket — Eventos
+// ═══════════════════════════════════════════════════════════
 wss.on("connection", (ws, req) => {
   const ip = req.socket.remoteAddress;
   clienteMap.set(ws, { device: "unknown", ip });
@@ -133,46 +102,27 @@ wss.on("connection", (ws, req) => {
         enviar(ws, { type: "ack", msg: `Bienvenido, ${device}` });
 
         if (device === "dashboard") {
-          enviar(ws, {
-            type:    "state_sync",
-            hidro:   { bomba: estadoBomba, sensores: datosSensores },
-            parking: estadoParking,
-          });
-          timestamp(`[SYNC] Estado completo enviado a dashboard (${ip})`);
+          enviar(ws, { type: "state_sync", parking: estadoParking });
+          timestamp(`[SYNC] Estado enviado a dashboard (${ip})`);
         }
 
         if (device === "esp32_parking") {
-          // Sincronizar estado de pluma al reconectar
-          enviar(ws, { type: "cmd_parking", pluma: estadoParking.pluma });
+          // Sincronizar estado de ambas plumas al reconectar
+          enviar(ws, { type: "cmd_parking", puerta: "entrada", accion: estadoParking.pluma_entrada });
+          enviar(ws, { type: "cmd_parking", puerta: "salida",  accion: estadoParking.pluma_salida  });
+          timestamp(`[SYNC] Estado de plumas enviado a esp32_parking (${ip})`);
         }
-        break;
-      }
-
-      // ── Datos sensores hidroponía ────────────────────────
-      case "sensor_data_hidro": {
-        const { temperatura, ph, nivel } = data;
-        datosSensores = { temperatura, ph, nivel };
-        timestamp(`[Hidro] Temp=${temperatura}°C | pH=${ph} | Nivel=${nivel}%`);
-        broadcast(
-          JSON.stringify({ type: "sensor_data_hidro", sensores: datosSensores }),
-          "dashboard"
-        );
-        evaluarAlertasHidro(temperatura, ph, nivel);
         break;
       }
 
       // ── Evento de parking ────────────────────────────────
       /*
-        El ESP32 detecta el orden de activación:
-          A → B  (A primero, luego B) = ENTRADA
-          B → A  (B primero, luego A) = SALIDA
-
-        Payload esperado:
+        Payload esperado del ESP32:
         {
           type:     "parking_event",
           evento:   "entrada" | "salida",
-          sensor_a: true|false,   // estado actual del sensor A
-          sensor_b: true|false    // estado actual del sensor B
+          sensor_a: true|false,
+          sensor_b: true|false
         }
       */
       case "parking_event": {
@@ -187,7 +137,7 @@ wss.on("connection", (ws, req) => {
             estadoParking.ultimo_evento = "entrada";
             timestamp(`[Parking] ENTRADA. Ocupados: ${estadoParking.lugares_ocupados}/${CAPACIDAD_MAX}`);
             registrarEventoParking("entrada");
-            ordenarPluma("abajo"); // bajar pluma para dejar pasar
+            ordenarPluma("entrada", "abajo");
           } else {
             timestamp("[Parking] ENTRADA denegada — parking lleno");
             evaluarAlertaParking("full");
@@ -199,7 +149,7 @@ wss.on("connection", (ws, req) => {
             estadoParking.ultimo_evento = "salida";
             timestamp(`[Parking] SALIDA. Ocupados: ${estadoParking.lugares_ocupados}/${CAPACIDAD_MAX}`);
             registrarEventoParking("salida");
-            ordenarPluma("abajo"); // bajar pluma para dejar salir
+            ordenarPluma("salida", "abajo");
           } else {
             timestamp("[Parking] SALIDA ignorada — contador ya en 0");
           }
@@ -214,10 +164,16 @@ wss.on("connection", (ws, req) => {
         break;
       }
 
-      // ── Confirmación estado pluma desde ESP32 ────────────
+      // ── Confirmación estado de pluma desde ESP32 ─────────
+      /*
+        { type: "pluma_status", puerta: "entrada"|"salida", accion: "arriba"|"abajo" }
+      */
       case "pluma_status": {
-        estadoParking.pluma = data.pluma;
-        timestamp(`[Parking] Pluma confirmada: ${data.pluma}`);
+        const { puerta, accion } = data;
+        if (puerta === "entrada") estadoParking.pluma_entrada = accion;
+        else if (puerta === "salida") estadoParking.pluma_salida = accion;
+
+        timestamp(`[Parking] Pluma ${puerta} confirmada: ${accion}`);
         broadcast(
           JSON.stringify({ type: "parking_state", ...estadoParking }),
           "dashboard"
@@ -243,16 +199,9 @@ wss.on("connection", (ws, req) => {
   ws.on("error", (err) => console.error("[WS] Error:", err.message));
 });
 
-// ── Helpers Hidroponía ─────────────────────────────────────
-function evaluarAlertasHidro(temperatura, ph, nivel) {
-  let alerta = null;
-  if (temperatura > 30)           alerta = `Temperatura alta: ${temperatura}°C`;
-  else if (ph < 6.0 || ph > 8.0)  alerta = `pH fuera de rango: ${ph}`;
-  else if (nivel < 20)             alerta = `Nivel de agua muy bajo: ${nivel}%`;
-  if (alerta) agregarNotificacion(notificacionesHidro, alerta, "hidro");
-}
-
-// ── Helpers Parking ────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════
+//  Helpers
+// ═══════════════════════════════════════════════════════════
 function evaluarAlertaParking(motivo) {
   const ocupados = estadoParking.lugares_ocupados;
   let alerta = null;
@@ -261,7 +210,7 @@ function evaluarAlertaParking(motivo) {
   } else if (ocupados >= Math.floor(CAPACIDAD_MAX * 0.9)) {
     alerta = `Parking al ${Math.round((ocupados / CAPACIDAD_MAX) * 100)}% de capacidad`;
   }
-  if (alerta) agregarNotificacion(notificacionesParking, alerta, "parking");
+  if (alerta) agregarNotificacion(alerta);
 }
 
 function registrarEventoParking(tipo) {
@@ -270,21 +219,22 @@ function registrarEventoParking(tipo) {
   if (historialParking.length > 20) historialParking.pop();
 }
 
-function ordenarPluma(posicion) {
-  estadoParking.pluma = posicion;
-  const payload = JSON.stringify({ type: "cmd_parking", pluma: posicion });
+function ordenarPluma(puerta, accion) {
+  if (puerta === "entrada") estadoParking.pluma_entrada = accion;
+  else if (puerta === "salida") estadoParking.pluma_salida = accion;
+
+  const payload = JSON.stringify({ type: "cmd_parking", puerta, accion });
   broadcast(payload, "esp32_parking");
   broadcast(payload, "dashboard");
-  timestamp(`[Parking] Pluma → ${posicion}`);
+  timestamp(`[Parking] Pluma ${puerta} → ${accion}`);
 }
 
-// ── Utilidades ─────────────────────────────────────────────
-function agregarNotificacion(lista, mensaje, origen) {
-  const n = { id: Date.now(), mensaje, origen, fecha: new Date().toISOString() };
-  lista.push(n);
-  if (lista.length > 50) lista.shift();
+function agregarNotificacion(mensaje) {
+  const n = { id: Date.now(), mensaje, fecha: new Date().toISOString() };
+  notificacionesParking.push(n);
+  if (notificacionesParking.length > 50) notificacionesParking.shift();
   broadcast(JSON.stringify({ type: "notification", data: n }), "dashboard");
-  timestamp(`[ALERTA ${origen.toUpperCase()}] ${mensaje}`);
+  timestamp(`[ALERTA] ${mensaje}`);
 }
 
 function enviar(ws, obj) {
@@ -303,22 +253,18 @@ function timestamp(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
-// ── Arrancar ───────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════
+//  Arrancar
+// ═══════════════════════════════════════════════════════════
 server.listen(PORT, () => {
   timestamp(`Servidor en http://localhost:${PORT}`);
   timestamp(`WebSocket en ws://localhost:${PORT}`);
-  console.log("──────────────────────────────────────────────");
-  console.log("  HIDROPONÍA");
-  console.log("    POST /cmd/hidro          { bomba: true|false }");
-  console.log("    GET  /state/hidro");
-  console.log("  PARKING");
-  console.log("    POST /cmd/parking        { pluma: 'arriba'|'abajo' }");
-  console.log("    POST /cmd/parking/reset");
-  console.log("    GET  /state/parking");
-  console.log("    GET  /parking/history");
-  console.log("  GENERAL");
-  console.log("    GET  /state");
-  console.log("    GET  /notifications");
-  console.log("    GET  /status");
-  console.log("──────────────────────────────────────────────");
+  console.log("──────────────────────────────────────────────────────");
+  console.log('  POST /cmd/parking   { puerta: "entrada"|"salida", accion: "arriba"|"abajo" }');
+  console.log("  POST /cmd/parking/reset");
+  console.log("  GET  /state");
+  console.log("  GET  /notifications");
+  console.log("  GET  /parking/history");
+  console.log("  GET  /status");
+  console.log("──────────────────────────────────────────────────────");
 });
